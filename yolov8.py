@@ -131,16 +131,16 @@ class Detect(nn.Module):
         self.stride = torch.zeros(len(ch))
 
         #分类和回归中间通道数
+        # 参考浅层特征图宽度 ch[0]//4，但如果类别数 nc 极大，用 min(self.nc, 100) 来防止分类分支的中间层变得过度臃肿
+        c2 = max(ch[0] // 4, min(self.nc, 100))
         #下限兜底 16 和 4*reg_max (即 64)，确保回归分支在提取特征时有足够的维度去表达 64 个概率分布；同时参考浅层特征图的宽度 ch[0]//4
-        c2 = max(16, ch[0]//4, 4*self.reg_max)
-        #参考浅层特征图宽度 ch[0]//4，但如果类别数 nc 极大，用 min(self.nc, 100) 来防止分类分支的中间层变得过度臃肿
-        c3 = max(ch[0]//4, min(self.nc, 100))
+        c3 = max(16, ch[0]//4, 4*self.reg_max)
 
         #分类分支，for x in ch：每个特征图，使用3个卷积，最后通道数为分类个数
         self.cv2 = nn.ModuleList(
             nn.Sequential(
-                nn.Conv2d(x, c2, 3),
-                nn.Conv2d(c2, c2, 3),
+                Conv(x, c2, 3),
+                Conv(c2, c2, 3),
                 nn.Conv2d(c2, self.nc, 1),
             ) for x in ch
         )
@@ -148,8 +148,8 @@ class Detect(nn.Module):
         #回归分支，最后通道数为检测点4个位置的距离维度
         self.cv3 = nn.ModuleList(
             nn.Sequential(
-                nn.Conv2d(x, c3, 3),
-                nn.Conv2d(c3, c3, 3),
+                Conv(x, c3, 3),
+                Conv(c3, c3, 3),
                 nn.Conv2d(c3, 4*self.reg_max, 1),
             ) for x in ch
         )
@@ -157,10 +157,10 @@ class Detect(nn.Module):
         self.dfl = DFL(self.reg_max) if self.reg_max > 1 else nn.Identity()
 
     def forward(self, x):
-        shape = x[0].shape()
+        shape = x[0].shape
 
         #分类与回归分支，每个特征图经过卷积后的结果
-        #y_cls: [[10,80,80,80],[10,80,60,60],[10,80,40,40]]
+        #y_cls: [[10,80,80,80],[10,80,40,40],[10,80,20,20]]
         y_cls=[]
         y_reg=[]
         for i in range(self.nl):
@@ -178,7 +178,7 @@ class Detect(nn.Module):
         #训练阶段
         if self.training:
             # pred:[10, 144, 6400+1600+400]
-            pred = torch.cat((cls_concatenated, reg_concatenated), 1)
+            pred = torch.cat((reg_concatenated, cls_concatenated), 1)
             return pred
         #推理阶段
         else:
@@ -213,3 +213,49 @@ class YOLOv8(nn.Module):
         self.sppf = SPPF(256,256,k=5)
 
         self.upsample = nn.Upsample(scale_factor=2, mode='nearest')
+
+        self.c2f_neck1 = C2f(256+128,128,n=1,add=False)
+
+        self.c2f_neck2 = C2f(128+64,64,n=1,add=False)
+
+        self.conv_neck1 = Conv(64, 64, k=3, s=2)
+
+        self.c2f_neck3 = C2f(128+64,128,n=1,add=False)
+
+        self.conv_neck2 = Conv(128, 128, k=3, s=2)
+
+        self.c2f_neck4 = C2f(256+128,256,n=1,add=False)
+
+        self.head = Detect(self.nc, ch=(64,128,256))
+
+    def forward(self, x):
+        x = self.stem(x)
+        x = self.c2f2(self.conv2(x))
+        p3 = self.c2f3(self.conv3(x))
+        p4 = self.c2f4(self.conv4(p3))
+        p5 = self.sppf(self.c2f5(self.conv5(p4)))
+
+        up_p5 = self.upsample(p5)
+        out_neck1 = self.c2f_neck1(torch.cat([up_p5, p4], 1))
+        up_neck1 = self.upsample(out_neck1)
+        out_p3 = self.c2f_neck2(torch.cat([up_neck1, p3], 1))
+        down_p3 = self.conv_neck1(out_p3)
+        out_p4 = self.c2f_neck3(torch.cat([out_neck1, down_p3], 1))
+        down_p4 = self.conv_neck2(out_p4)
+        out_p5 = self.c2f_neck4(torch.cat([p5, down_p4], 1))
+
+        pred = self.head([out_p3, out_p4, out_p5])
+
+        return pred
+
+
+if __name__ == '__main__':
+    model = YOLOv8(nc=2)
+    model.train()
+    dummy_image = torch.randn(1, 3, 640, 640)
+    out = model(dummy_image)
+
+    if out.shape == (1,66,8400):
+        print("success, out shape is {}".format(out.shape))
+    else:
+        print("fail, out shape is {}".format(out.shape))
