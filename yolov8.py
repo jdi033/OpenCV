@@ -249,13 +249,106 @@ class YOLOv8(nn.Module):
         return pred
 
 
-if __name__ == '__main__':
-    model = YOLOv8(nc=2)
-    model.train()
-    dummy_image = torch.randn(1, 3, 640, 640)
-    out = model(dummy_image)
+# if __name__ == '__main__':
+#     model = YOLOv8(nc=2)
+#     model.train()
+#     dummy_image = torch.randn(1, 3, 640, 640)
+#     out = model(dummy_image)
+#
+#     if out.shape == (1,66,8400):
+#         print("success, out shape is {}".format(out.shape))
+#     else:
+#         print("fail, out shape is {}".format(out.shape))
 
-    if out.shape == (1,66,8400):
-        print("success, out shape is {}".format(out.shape))
-    else:
-        print("fail, out shape is {}".format(out.shape))
+#计算交并比
+def bbox_iou(box1, box2):
+    #box1预测框[B,N,4] box2真实框[B,M,4]
+
+    #增加维度，方便计算
+    b1 = box1.unsqueeze(1)
+    b2 = box2.unsqueeze(2)
+    #计算交集的左上角和右下角
+    inter_l = torch.max(b1[..., :2], b2[..., :2])
+    inter_r = torch.min(b1[..., 2:], b2[..., 2:])
+    #交集的高宽
+    inter_wh = (inter_r - inter_l).clamp(min=0)
+    #交集面积
+    inter_area = inter_wh[..., 0] * inter_wh[..., 1]
+    #分别计算两个框的面积
+    area1 = (b1[..., 2] - b1[..., 0]) * (b1[..., 3] - b1[..., 1])
+    area2 = (b2[..., 2] - b2[..., 0]) * (b2[..., 3] - b2[..., 1])
+    #并集面积
+    union_area = area1 + area2 - inter_area + 1e-16
+    #返回交并比IoU
+    return inter_area / union_area
+
+#任务对齐分配器
+class TaskAlignedAssigner(nn.Module):
+
+    def __init__(self, topk=10, alpha=0.5, beta=6.0):
+        super().__init__()
+        #为每个真实缺陷的候选正样本数量
+        self.topk = topk
+        #分类得分的权重
+        self.alpha = alpha
+        #交并比的权重
+        self.beta = beta
+
+    def forward(self, pred_scores, pred_bboxes, gt_labels, gt_bboxes):
+        #pred_scores: 预测的分类得分[B,N,nc]  pred_bboxes: 预测的坐标[B,N,4]
+        #gt_labels: 真实的分类标签[B,M,1]  gt_bboxes: 真实的缺陷框坐标[B,M,4]
+        B, M, _ = gt_bboxes.shape
+        B, N, nc = pred_scores.shape
+        #扩展维度[B,M,1]->[B,M,N]，以便gather操作
+        target_labels = gt_labels.long().expand(B,M,N)
+        #预测分类对于真是分类的分类得分
+        #scores:[B,M,N], 每个缺陷对应每个预测点在该类别的预测概率
+        scores = pred_scores.permute(0, 2, 1).gather(1, target_labels)
+        #交并比，ious:[B,M,N]
+        ious = bbox_iou(pred_bboxes, gt_bboxes)
+        ious = ious.clamp(min=0)
+        #计算对交分数，某个预测点对应某个缺陷的匹配度[B,M,N]
+        alignment_metrics = (scores**self.alpha) * (ious**self.beta)
+        #取前topk个分类最高得分[B,M,topk]
+        topk_metrics, topk_idxs = torch.topk(alignment_metrics, self.topk, dim=-1)
+
+        #构建掩码
+        mask_pos = torch.zeros_like(alignment_metrics)
+        #将topk_ids位置赋值1
+        mask_pos = mask_pos.scatter_(-1, topk_idxs, 1.0)
+        #过滤虽然进了topk，但得分低
+        mask_pos = mask_pos*(alignment_metrics>1e-9).float()
+
+        #独立原则，如果一个预测点同时入选多个缺陷的topk，只去分数最高的,[B,N]
+        max_metrics, max_idxs = alignment_metrics.max(dim=1)
+        #最终的正样本mask[B,M,N]
+        is_max_mask = (alignment_metrics == max_metrics.unsqueeze(1)).float()
+
+        #即入选topk，又满足独立原则
+        mask_pos = mask_pos * is_max_mask
+
+        return mask_pos, alignment_metrics
+
+if __name__ == '__main__':
+    assigner = TaskAlignedAssigner(topk=10, alpha=0.5, beta=6.0)
+
+    #伪造预测数据
+    B,N,nc = 1, 8400,2
+    pred_scores = torch.randn(B, N, nc).sigmoid()
+    pred_bboxes = torch.randn(B, N, 4)*640
+    pred_bboxes[..., 2:] += pred_bboxes[..., :2]
+
+    #伪造真实缺陷数据
+    M=1
+    gt_labels = torch.tensor([[[1.0]]])
+    gt_bboxes = torch.tensor([[[100.0, 100.0, 120.0, 120.0]]])
+
+    mask_pos, alignment_metrics = assigner(pred_scores, pred_bboxes, gt_labels, gt_bboxes)
+
+    print(f"生成的正样本掩码 (Mask) 维度: {mask_pos.shape}")
+
+    # 统计有多少个点被选为了正样本去负责预测这个“砂眼”
+    num_positives = mask_pos.sum().item()
+    print(f"🎯 在 8400 个预测点中，有 {int(num_positives)} 个点被提拔为 '正样本'。")
+    print(f"👻 剩下的 {8400 - int(num_positives)} 个点将被无情压制，计算背景 Loss。")
+
