@@ -329,26 +329,142 @@ class TaskAlignedAssigner(nn.Module):
 
         return mask_pos, alignment_metrics
 
-if __name__ == '__main__':
-    assigner = TaskAlignedAssigner(topk=10, alpha=0.5, beta=6.0)
+# if __name__ == '__main__':
+#     assigner = TaskAlignedAssigner(topk=10, alpha=0.5, beta=6.0)
+#
+#     #伪造预测数据
+#     B,N,nc = 1, 8400,2
+#     pred_scores = torch.randn(B, N, nc).sigmoid()
+#     pred_bboxes = torch.randn(B, N, 4)*640
+#     pred_bboxes[..., 2:] += pred_bboxes[..., :2]
+#
+#     #伪造真实缺陷数据
+#     M=1
+#     gt_labels = torch.tensor([[[1.0]]])
+#     gt_bboxes = torch.tensor([[[100.0, 100.0, 120.0, 120.0]]])
+#
+#     mask_pos, alignment_metrics = assigner(pred_scores, pred_bboxes, gt_labels, gt_bboxes)
+#
+#     print(f"生成的正样本掩码 (Mask) 维度: {mask_pos.shape}")
+#
+#     # 统计有多少个点被选为了正样本去负责预测这个“砂眼”
+#     num_positives = mask_pos.sum().item()
+#     print(f"🎯 在 8400 个预测点中，有 {int(num_positives)} 个点被提拔为 '正样本'。")
+#     print(f"👻 剩下的 {8400 - int(num_positives)} 个点将被无情压制，计算背景 Loss。")
 
-    #伪造预测数据
-    B,N,nc = 1, 8400,2
-    pred_scores = torch.randn(B, N, nc).sigmoid()
-    pred_bboxes = torch.randn(B, N, 4)*640
-    pred_bboxes[..., 2:] += pred_bboxes[..., :2]
 
-    #伪造真实缺陷数据
-    M=1
+
+def bbox_iou_1v1(box1, box2):
+    #box1: [Number_pos, 4]
+    inter_l = torch.max(box1[:, :2], box2[:, :2])
+    inter_r = torch.min(box1[:, 2:], box2[:, 2:])
+
+    inter_wh = (inter_r - inter_l).clamp(min=0)
+    inter_area = inter_wh[:, 0] * inter_wh[:, 1]
+
+    area1 = (box1[:, 2] - box1[:, 0]) * (box1[:, 3] - box1[:, 1])
+    area2 = (box2[:, 2] - box2[:, 0]) * (box2[:, 3] - box2[:, 1])
+
+    union_area = area1 + area2 - inter_area
+
+    return inter_area / union_area
+
+class v8DetectionLoss(nn.Module):
+    def __init__(self, nc=2):
+        super(v8DetectionLoss, self).__init__()
+        self.assigner = TaskAlignedAssigner(topk=10, alpha=0.5, beta=6.0)
+        self.bce = nn.BCEWithLogitsLoss(reduction='none')
+
+    def forward(self, pred_scores, pred_bboxes, gt_labels, gt_bboxes):
+        #no_grad告诉pytorch，以下不参数梯度计算。.detach()会生成一个新的张量，并且计算不会返回修改权重
+        with torch.no_grad():
+            mask_pos, alignment_metrics = self.assigner(
+                pred_scores.detach().sigmoid(),
+                pred_bboxes.detach(),
+                gt_labels,
+                gt_bboxes)
+            #找到所有正样本，以及他们负责的缺陷索引，fg_mask, target_gt_idx:[B,N]
+            fg_mask, target_gt_idx = mask_pos.max(dim=1)
+            #正样本个数
+            target_scores_sum = max(fg_mask.sum(), 1.0)
+
+        #计算分类损失
+        #初始化分类目标矩阵[B,N,nc]
+        target_scores = torch.zeros_like(pred_scores)
+        #每个预测点在所有缺陷上的最高分类得分
+        max_metrics, _ = alignment_metrics.max(dim=1)
+
+        for b in range(B):
+            #在b张图片上，不为0的正样本的位置下标索引
+            pos_idxs = fg_mask(b).nonzero().squeeze(-1)
+            #防止正样本个数小于0
+            if pos_idxs.numel() > 0:
+                #正样本预测的是哪个缺陷
+                assigned_gt_idx = target_gt_idx[b, pos_idxs]
+                #这些缺陷对用哪个类别
+                pos_target_lables = gt_labels[b,assigned_gt_idx]
+                #正样本的最高得分作为计算损失函数的目标分类得分
+                target_scores[b,pos_idxs,pos_target_lables] = max_metrics[b, pos_idxs]
+
+        #pred_scores预测分类得分，target_scores该预测点应该预测的缺陷以及最高得分，最后target_scores_sum总正样本数算平均
+        loss_cls = self.bce(pred_scores, target_scores).sum() / target_scores_sum
+
+        #计算回归损失
+        #zeros(1)创建一维的元素为0的张量，
+        #device=pred_scores.device使得创建的loss_box张量和网络输出的张量在同一张显卡上，不会设备报错
+        loss_box = torch.zeros(1, device=pred_scores.device)
+
+        if fg_mask.sum() > 0:
+            for b in range(B):
+                pos_idxs = fg_mask[b].nonzero().squeeze(-1)
+                #这些正样本预测的回归框
+                pos_pred_bboxes = pred_bboxes[b, pos_idxs]
+                #正样本对应的缺陷
+                assigned_gt_idx = target_gt_idx[b, pos_idxs]
+                #这些缺陷的真实框
+                pos_gt_bboxes = gt_bboxes[b, assigned_gt_idx]
+                #计算预测框与真实框的iou
+                bbox_iou = bbox_iou_1v1(pos_pred_bboxes, pos_gt_bboxes)
+
+                #计算总回归损失，iou越大越好，使用(1-iou)作为惩罚
+                loss_box += (1-bbox_iou).sum()
+
+        #平均值
+        loss_box = loss_box / fg_mask.sum()
+
+        #1.5为权重放大系数
+        return loss_cls + loss_box*1.5
+
+
+if __name__ == "__main__":
+    print("🚀 启动网络完整闭环：前向计算 + 损失算账 + 梯度反传...")
+
+    # 1. 模拟网络前向传播产生的预测结果 (要设置 requires_grad=True 让张量带有梯度属性)
+    B, N, nc = 1, 8400, 2
+    # 注意：这里模拟的是 Detect 头没经过 sigmoid 的原始输出 Logits
+    dummy_pred_scores = torch.randn(B, N, nc, requires_grad=True)
+    dummy_pred_bboxes = (torch.rand(B, N, 4) * 640).clone().detach().requires_grad_(True)
+
+    # 2. 模拟真实标签 (GT)
     gt_labels = torch.tensor([[[1.0]]])
     gt_bboxes = torch.tensor([[[100.0, 100.0, 120.0, 120.0]]])
 
-    mask_pos, alignment_metrics = assigner(pred_scores, pred_bboxes, gt_labels, gt_bboxes)
+    # 3. 实例化我们刚写的结算中心
+    criterion = v8DetectionLoss(nc=2)
 
-    print(f"生成的正样本掩码 (Mask) 维度: {mask_pos.shape}")
+    # 4. === 前向算账 (Forward Pass) ===
+    total_loss = criterion(dummy_pred_scores, dummy_pred_bboxes, gt_labels, gt_bboxes)
 
-    # 统计有多少个点被选为了正样本去负责预测这个“砂眼”
-    num_positives = mask_pos.sum().item()
-    print(f"🎯 在 8400 个预测点中，有 {int(num_positives)} 个点被提拔为 '正样本'。")
-    print(f"👻 剩下的 {8400 - int(num_positives)} 个点将被无情压制，计算背景 Loss。")
+    print(f"💰 网络在当前随机状态下，对这张图像评估的‘糟糕程度’ (Total Loss): {total_loss.item():.4f}")
 
+    # 5. === 见证奇迹的时刻：反向求导 (Backward Pass) ===
+    # 这行代码会沿着计算图一路往回走，自动算出每一个卷积核为了降低这个 Loss 应该如何修改
+    total_loss.backward()
+
+    # 6. 验证梯度是否真的传回来了
+    print(f"⚡ 预测分类张量是否获得了梯度 (Gradient)？: {dummy_pred_scores.grad is not None}")
+
+    if dummy_pred_scores.grad is not None:
+        # 打印出前 5 个网格点的第一个类别的梯度数值看看
+        print(f"📊 前 5 个预测点的梯度值摘录:\n{dummy_pred_scores.grad[0, :5, 0]}")
+        print("\n🎉 恭喜你！从主干网络到 Detect 头，再到 Assigner 和 Loss，你手工打造的深度学习引擎已经可以完美运转了！")
