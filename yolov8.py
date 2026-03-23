@@ -365,17 +365,37 @@ def bbox_iou_1v1(box1, box2):
     area1 = (box1[:, 2] - box1[:, 0]) * (box1[:, 3] - box1[:, 1])
     area2 = (box2[:, 2] - box2[:, 0]) * (box2[:, 3] - box2[:, 1])
 
-    union_area = area1 + area2 - inter_area
+    union_area = area1 + area2 - inter_area + 1e-16
 
     return inter_area / union_area
 
 class v8DetectionLoss(nn.Module):
-    def __init__(self, nc=2):
+    def __init__(self, nc=2, reg_max=16):
         super(v8DetectionLoss, self).__init__()
         self.assigner = TaskAlignedAssigner(topk=10, alpha=0.5, beta=6.0)
         self.bce = nn.BCEWithLogitsLoss(reduction='none')
+        self.reg_max = reg_max
+        #将DFL模块放进Loss中
+        self.dfl = DFL(reg_max) if reg_max > 0 else nn.Identity()
+        #特征图步长，先在这里写死
+        self.strides = [8,16,32]
 
-    def forward(self, pred_scores, pred_bboxes, gt_labels, gt_bboxes):
+    def forward(self, pred_scores, pred_dist, gt_labels, gt_bboxes, image_shape=(640,640)):
+        #pred_dist为回归分支处理的最原始64维分布特征[B,N,64]
+        B,N,nc = pred_scores.shape
+
+        #特征图尺寸
+        feats_shape = [(image_shape[0]//s, image_shape[1]//s) for s in self.strides]
+        #锚点的位置[N,2]
+        anchor_points = make_anchor(feats_shape, self.strides).to(pred_scores.device)
+        #pred_dist为[B,N,64],而DFL需要[B,64,N]
+        dist_permuted = pred_dist.permute(0,2,1)
+        #pred_ltrb:相对距离[B,4,N]
+        pred_ltrb = self.dfl(dist_permuted)
+        #再次转置[B,N,4]
+        pred_ltrb = pred_ltrb.permute(0,2,1)
+        pred_bboxes = dist2bbox(pred_ltrb, anchor_points, xywh=False, dim=-1)
+
         #no_grad告诉pytorch，以下不参数梯度计算。.detach()会生成一个新的张量，并且计算不会返回修改权重
         with torch.no_grad():
             mask_pos, alignment_metrics = self.assigner(
@@ -385,8 +405,8 @@ class v8DetectionLoss(nn.Module):
                 gt_bboxes)
             #找到所有正样本，以及他们负责的缺陷索引，fg_mask, target_gt_idx:[B,N]
             fg_mask, target_gt_idx = mask_pos.max(dim=1)
-            #正样本个数
-            target_scores_sum = max(fg_mask.sum(), 1.0)
+            #正样本个数,torch.clamp 确保分母至少为 1.0，防止除零
+            target_scores_sum = torch.clamp(fg_mask.sum(), min=1.0)
 
         #计算分类损失
         #初始化分类目标矩阵[B,N,nc]
@@ -396,13 +416,13 @@ class v8DetectionLoss(nn.Module):
 
         for b in range(B):
             #在b张图片上，不为0的正样本的位置下标索引
-            pos_idxs = fg_mask(b).nonzero().squeeze(-1)
+            pos_idxs = fg_mask[b].nonzero().squeeze(-1)
             #防止正样本个数小于0
             if pos_idxs.numel() > 0:
                 #正样本预测的是哪个缺陷
                 assigned_gt_idx = target_gt_idx[b, pos_idxs]
                 #这些缺陷对用哪个类别
-                pos_target_lables = gt_labels[b,assigned_gt_idx]
+                pos_target_lables = gt_labels[b,assigned_gt_idx,0].long()
                 #正样本的最高得分作为计算损失函数的目标分类得分
                 target_scores[b,pos_idxs,pos_target_lables] = max_metrics[b, pos_idxs]
 
@@ -429,8 +449,8 @@ class v8DetectionLoss(nn.Module):
                 #计算总回归损失，iou越大越好，使用(1-iou)作为惩罚
                 loss_box += (1-bbox_iou).sum()
 
-        #平均值
-        loss_box = loss_box / fg_mask.sum()
+            #平均值
+            loss_box = loss_box / fg_mask.sum()
 
         #1.5为权重放大系数
         return loss_cls + loss_box*1.5
@@ -468,3 +488,39 @@ if __name__ == "__main__":
         # 打印出前 5 个网格点的第一个类别的梯度数值看看
         print(f"📊 前 5 个预测点的梯度值摘录:\n{dummy_pred_scores.grad[0, :5, 0]}")
         print("\n🎉 恭喜你！从主干网络到 Detect 头，再到 Assigner 和 Loss，你手工打造的深度学习引擎已经可以完美运转了！")
+
+
+#预测框对锚点的相对距离 + 锚点位置 -> 绝对距离
+def dist2bbox(distance, anchor_points, xywh=True, dim=-1):
+    #distance[B,N,4](l,t,r,b), anchor_points[N,2](cx,cy)
+    #lt[B,N,2]
+    lt, rb = distance.chunk(2, dim)
+    #左上，右下坐标
+    x1y1 = anchor_points - lt
+    x2y2 = anchor_points + rb
+
+    if xywh:
+        c_xy = (x1y1+x2y2)/2
+        wh = x2y2-x1y1
+        #返回格式为：[B,N,4](cx,cy,w,h)
+        return torch.cat((c_xy, wh), dim=dim)
+
+    # 返回格式为：[B,N,4](x1,y1,x2,y2)
+    return torch.cat((x1y1, x2y2), dim=dim)
+
+
+#根据特征图尺寸和步长，将8400个坐标计算出锚点坐标
+def make_anchor(feats_shape, strides, grid_cell_offset=0.5):
+    #feats_shape特征图尺寸[P3,P4,P5][(80,80),(40,40),(20,20)],strides步长[8,16,32],grid_cell_offset网格中心偏移量
+    #
+    anchor_points = []
+    for i, stride in enumerate(strides):
+        h,w = feats_shape[i]
+        #小网格的位置索引,[h,w]
+        stride_y, stride_x = torch.meshgrid(torch.arange(end=h), torch.arange(end=w), indexing='ij')
+        #torch.stack((stride_y, stride_x), dim=-1):[h,w,2],view(-1, 2)展平为[h*w,2]
+        anchors = torch.stack((stride_x, stride_y), dim=-1).view(-1, 2) + grid_cell_offset
+        anchor_points.append(anchors*stride)
+
+    #P3, P4, P5 的锚点在第 0 维度拼接起来: 6400 + 1600 + 400 = 8400,[8400, 2]
+    return torch.cat(anchor_points, dim=0)
