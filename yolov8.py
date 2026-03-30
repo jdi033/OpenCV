@@ -178,8 +178,12 @@ class Detect(nn.Module):
         #训练阶段
         if self.training:
             # pred:[10, 144, 6400+1600+400]
-            pred = torch.cat((reg_concatenated, cls_concatenated), 1)
-            return pred
+            #pred = torch.cat((reg_concatenated, cls_concatenated), 1)
+            #return pred
+            # 不要 torch.cat 拼接了，直接返回分离的特征图！
+            # cls_concatenated: [B, 80, 8400] -> 转置为 [B, 8400, 80] (适应 Loss 接收)
+            # reg_concatenated: [B, 64, 8400] -> 转置为 [B, 8400, 64]
+            return cls_concatenated.permute(0, 2, 1), reg_concatenated.permute(0, 2, 1)
         #推理阶段
         else:
             #在yolo中，多类别分类不能使用softmax，因为softmax只能用于类别之间不冲突(概率之和为1)，yolo可以预测出多个类别，是将多分类独立成多个二分类任务
