@@ -2,6 +2,7 @@
 import torch
 from torch.utils.data import DataLoader
 import torch.optim as optim
+import os
 
 # ==========================================
 # 工业级模块化引入：从你写的另两个文件导入核心组件
@@ -60,20 +61,28 @@ def train_model():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"🖥️ 当前使用的计算设备: {device}")
 
-    model = YOLOv8(nc=2).to(device)
-    model.train()  # 开启训练模式
+    # 【改动 1】：COCO 数据集有 80 个类别，必须把 nc 改为 80！
+    NUM_CLASSES = 80
+    model = YOLOv8(nc=NUM_CLASSES).to(device)
+    model.train()
 
-    criterion = v8DetectionLoss(nc=2, reg_max=16).to(device)
+    criterion = v8DetectionLoss(nc=NUM_CLASSES, reg_max=16).to(device)
 
-    # 2. 准备数据集与 DataLoader (直接调用导入的 YOLODataset)
-    dataset = YOLODataset(img_dir="dummy_images", label_dir="dummy_labels", img_size=640)
-    dataloader = DataLoader(dataset, batch_size=1, shuffle=True, collate_fn=yolo_collate_fn)
+    # 【改动 2】：对接真实的 COCO128 文件夹路径，并将 Batch Size 调大一点利用 GPU (例如 4 或 8)
+    dataset = YOLODataset(
+        img_dir="coco128/images/train2017",
+        label_dir="coco128/labels/train2017",
+        img_size=640
+    )
+    dataloader = DataLoader(dataset, batch_size=4, shuffle=True, collate_fn=yolo_collate_fn)
 
     # 3. 配置优化器 (Optimizer)
     optimizer = optim.AdamW(model.parameters(), lr=1e-3, weight_decay=1e-4)
 
-    # 4. 进入 Epoch 循环
-    num_epochs = 5
+    # 【改动 3】：创建存放权重的文件夹，并将 Epoch 数量调大
+    os.makedirs("weights", exist_ok=True)
+    num_epochs = 50
+
     for epoch in range(num_epochs):
         epoch_loss = 0.0
 
@@ -84,7 +93,6 @@ def train_model():
 
             optimizer.zero_grad()
 
-            # 【注意】：确保你的 YOLOv8 forward 现在返回的是两个解耦的张量
             pred_scores, pred_dist = model(imgs)
 
             loss = criterion(pred_scores, pred_dist, gt_labels, gt_bboxes)
@@ -92,9 +100,20 @@ def train_model():
             optimizer.step()
 
             epoch_loss += loss.item()
-            print(f"   [Epoch {epoch + 1}/{num_epochs}] Batch {batch_idx + 1} | 当前 Loss: {loss.item():.4f}")
 
-        print(f"✅ Epoch {epoch + 1} 结束 | 平均 Loss: {epoch_loss / len(dataloader):.4f}")
+            # 打印每个 batch 的 loss 看得太眼花，可以注释掉，只看 Epoch 的平均 Loss
+            # print(f"   [Epoch {epoch + 1}/{num_epochs}] Batch {batch_idx + 1} | 当前 Loss: {loss.item():.4f}")
+
+        avg_loss = epoch_loss / len(dataloader)
+        print(f"✅ Epoch {epoch + 1}/{num_epochs} 结束 | 平均 Loss: {avg_loss:.4f}")
+
+        # 【改动 4】：每 10 个 Epoch，以及最后 1 个 Epoch 时，保存模型的“灵魂”！
+        if (epoch + 1) % 10 == 0 or (epoch + 1) == num_epochs:
+            save_path = f"weights/yolov8_custom_epoch_{epoch + 1}.pt"
+            torch.save(model.state_dict(), save_path)
+            print(f"💾 模型权重已保存至: {save_path}")
+
+    print("\n🎉 训练圆满结束！你的模型已经学到了知识！")
 
 
 if __name__ == '__main__':

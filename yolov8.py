@@ -1,5 +1,3 @@
-from symtable import Class
-
 import torch
 import torch.nn as nn
 
@@ -252,18 +250,6 @@ class YOLOv8(nn.Module):
 
         return pred
 
-
-# if __name__ == '__main__':
-#     model = YOLOv8(nc=2)
-#     model.train()
-#     dummy_image = torch.randn(1, 3, 640, 640)
-#     out = model(dummy_image)
-#
-#     if out.shape == (1,66,8400):
-#         print("success, out shape is {}".format(out.shape))
-#     else:
-#         print("fail, out shape is {}".format(out.shape))
-
 #计算交并比
 def bbox_iou(box1, box2):
     #box1预测框[B,N,4] box2真实框[B,M,4]
@@ -304,7 +290,14 @@ class TaskAlignedAssigner(nn.Module):
         B, M, _ = gt_bboxes.shape
         B, N, nc = pred_scores.shape
         #扩展维度[B,M,1]->[B,M,N]，以便gather操作
-        target_labels = gt_labels.long().expand(B,M,N)
+        # 核心修复：填充框防御机制
+        # 1. 生成真实框的掩码 (把为了对齐 Batch 而填充的 -1 剔除)
+        # 如果标签 > -1，就是真实的缺陷，mask 值为 1.0；否则为 0.0
+        mask_gt = (gt_labels > -1.0).float().expand(B, M, N)  # [B, M, N]
+
+        # 2. 将 -1 强行拉回 0，防止底层 CUDA 的 gather 操作数组越界崩溃！
+        # 因为有 mask_gt 兜底，这里借用 0 不会产生任何实质影响
+        target_labels = gt_labels.long().clamp(min=0).expand(B, M, N)
         #预测分类对于真是分类的分类得分
         #scores:[B,M,N], 每个缺陷对应每个预测点在该类别的预测概率
         scores = pred_scores.permute(0, 2, 1).gather(1, target_labels)
@@ -312,7 +305,9 @@ class TaskAlignedAssigner(nn.Module):
         ious = bbox_iou(pred_bboxes, gt_bboxes)
         ious = ious.clamp(min=0)
         #计算对交分数，某个预测点对应某个缺陷的匹配度[B,M,N]
-        alignment_metrics = (scores**self.alpha) * (ious**self.beta)
+        # 核心修复：抹杀假框得分
+        # 计算对齐分数时，必须乘上 mask_gt，把那些假框的得分直接清零！
+        alignment_metrics = (scores ** self.alpha) * (ious ** self.beta) * mask_gt
         #取前topk个分类最高得分[B,M,topk]
         topk_metrics, topk_idxs = torch.topk(alignment_metrics, self.topk, dim=-1)
 
@@ -320,8 +315,8 @@ class TaskAlignedAssigner(nn.Module):
         mask_pos = torch.zeros_like(alignment_metrics)
         #将topk_ids位置赋值1
         mask_pos = mask_pos.scatter_(-1, topk_idxs, 1.0)
-        #过滤虽然进了topk，但得分低
-        mask_pos = mask_pos*(alignment_metrics>1e-9).float()
+        # 过滤虽然进了topk，但得分低 (这里的 1e-9 也能顺便把全 0 的假框彻底过滤掉)
+        mask_pos = mask_pos * (alignment_metrics > 1e-9).float()
 
         #独立原则，如果一个预测点同时入选多个缺陷的topk，只去分数最高的,[B,N]
         max_metrics, max_idxs = alignment_metrics.max(dim=1)
@@ -332,31 +327,6 @@ class TaskAlignedAssigner(nn.Module):
         mask_pos = mask_pos * is_max_mask
 
         return mask_pos, alignment_metrics
-
-# if __name__ == '__main__':
-#     assigner = TaskAlignedAssigner(topk=10, alpha=0.5, beta=6.0)
-#
-#     #伪造预测数据
-#     B,N,nc = 1, 8400,2
-#     pred_scores = torch.randn(B, N, nc).sigmoid()
-#     pred_bboxes = torch.randn(B, N, 4)*640
-#     pred_bboxes[..., 2:] += pred_bboxes[..., :2]
-#
-#     #伪造真实缺陷数据
-#     M=1
-#     gt_labels = torch.tensor([[[1.0]]])
-#     gt_bboxes = torch.tensor([[[100.0, 100.0, 120.0, 120.0]]])
-#
-#     mask_pos, alignment_metrics = assigner(pred_scores, pred_bboxes, gt_labels, gt_bboxes)
-#
-#     print(f"生成的正样本掩码 (Mask) 维度: {mask_pos.shape}")
-#
-#     # 统计有多少个点被选为了正样本去负责预测这个“砂眼”
-#     num_positives = mask_pos.sum().item()
-#     print(f"🎯 在 8400 个预测点中，有 {int(num_positives)} 个点被提拔为 '正样本'。")
-#     print(f"👻 剩下的 {8400 - int(num_positives)} 个点将被无情压制，计算背景 Loss。")
-
-
 
 def bbox_iou_1v1(box1, box2):
     #box1: [Number_pos, 4]
@@ -458,41 +428,6 @@ class v8DetectionLoss(nn.Module):
 
         #1.5为权重放大系数
         return loss_cls + loss_box*1.5
-
-
-if __name__ == "__main__":
-    print("🚀 启动网络完整闭环：前向计算 + 损失算账 + 梯度反传...")
-
-    # 1. 模拟网络前向传播产生的预测结果 (要设置 requires_grad=True 让张量带有梯度属性)
-    B, N, nc = 1, 8400, 2
-    # 注意：这里模拟的是 Detect 头没经过 sigmoid 的原始输出 Logits
-    dummy_pred_scores = torch.randn(B, N, nc, requires_grad=True)
-    dummy_pred_bboxes = (torch.rand(B, N, 4) * 640).clone().detach().requires_grad_(True)
-
-    # 2. 模拟真实标签 (GT)
-    gt_labels = torch.tensor([[[1.0]]])
-    gt_bboxes = torch.tensor([[[100.0, 100.0, 120.0, 120.0]]])
-
-    # 3. 实例化我们刚写的结算中心
-    criterion = v8DetectionLoss(nc=2)
-
-    # 4. === 前向算账 (Forward Pass) ===
-    total_loss = criterion(dummy_pred_scores, dummy_pred_bboxes, gt_labels, gt_bboxes)
-
-    print(f"💰 网络在当前随机状态下，对这张图像评估的‘糟糕程度’ (Total Loss): {total_loss.item():.4f}")
-
-    # 5. === 见证奇迹的时刻：反向求导 (Backward Pass) ===
-    # 这行代码会沿着计算图一路往回走，自动算出每一个卷积核为了降低这个 Loss 应该如何修改
-    total_loss.backward()
-
-    # 6. 验证梯度是否真的传回来了
-    print(f"⚡ 预测分类张量是否获得了梯度 (Gradient)？: {dummy_pred_scores.grad is not None}")
-
-    if dummy_pred_scores.grad is not None:
-        # 打印出前 5 个网格点的第一个类别的梯度数值看看
-        print(f"📊 前 5 个预测点的梯度值摘录:\n{dummy_pred_scores.grad[0, :5, 0]}")
-        print("\n🎉 恭喜你！从主干网络到 Detect 头，再到 Assigner 和 Loss，你手工打造的深度学习引擎已经可以完美运转了！")
-
 
 #预测框对锚点的相对距离 + 锚点位置 -> 绝对距离
 def dist2bbox(distance, anchor_points, xywh=True, dim=-1):
