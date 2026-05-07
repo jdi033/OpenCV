@@ -54,12 +54,12 @@ def train_model():
     print(f"PyTorch 版本: {torch.__version__}")
     print(f"CUDA 是否可用: {torch.cuda.is_available()}")
     print("\n" + "=" * 50)
-    print("🔥 引擎点火：YOLOv8 工业级训练大闭环正式启动 🔥")
+    print("引擎点火：YOLOv8 工业级训练大闭环正式启动")
     print("=" * 50)
 
     # 1. 实例化网络与损失结算中心
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"🖥️ 当前使用的计算设备: {device}")
+    print(f"当前使用的计算设备: {device}")
 
     # 【改动 1】：COCO 数据集有 80 个类别，必须把 nc 改为 80！
     NUM_CLASSES = 80
@@ -81,7 +81,7 @@ def train_model():
 
     # 【改动 3】：创建存放权重的文件夹，并将 Epoch 数量调大
     os.makedirs("weights", exist_ok=True)
-    num_epochs = 50
+    num_epochs = 100
 
     for epoch in range(num_epochs):
         epoch_loss = 0.0
@@ -105,15 +105,15 @@ def train_model():
             # print(f"   [Epoch {epoch + 1}/{num_epochs}] Batch {batch_idx + 1} | 当前 Loss: {loss.item():.4f}")
 
         avg_loss = epoch_loss / len(dataloader)
-        print(f"✅ Epoch {epoch + 1}/{num_epochs} 结束 | 平均 Loss: {avg_loss:.4f}")
+        print(f"Epoch {epoch + 1}/{num_epochs} 结束 | 平均 Loss: {avg_loss:.4f}")
 
         # 【改动 4】：每 10 个 Epoch，以及最后 1 个 Epoch 时，保存模型的“灵魂”！
         if (epoch + 1) % 10 == 0 or (epoch + 1) == num_epochs:
             save_path = f"weights/yolov8_custom_epoch_{epoch + 1}.pt"
             torch.save(model.state_dict(), save_path)
-            print(f"💾 模型权重已保存至: {save_path}")
+            print(f"模型权重已保存至: {save_path}")
 
-    print("\n🎉 训练圆满结束！你的模型已经学到了知识！")
+    print("\n训练圆满结束！你的模型已经学到了知识！")
 
 
 if __name__ == '__main__':

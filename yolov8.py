@@ -100,7 +100,8 @@ class DFL(nn.Module):
         #生成一个长度为reg_max的数组：[0,1,2...,15]
         grid = torch.arange(reg_max, dtype=torch.float)
         #赋值self.grid形状: [1,16,1,1]
-        self.register_buffer('grid', grid.view(1, reg_max, 1, 1))
+        #self.register_buffer('grid', grid.view(1, reg_max, 1, 1))
+        self.conv.weight.data[:] = nn.Parameter(grid.view(1, reg_max, 1, 1))
         self.c1 = reg_max
 
     def forward(self, x):
@@ -361,13 +362,19 @@ class v8DetectionLoss(nn.Module):
         #特征图尺寸
         feats_shape = [(image_shape[0]//s, image_shape[1]//s) for s in self.strides]
         #锚点的位置[N,2]
-        anchor_points = make_anchor(feats_shape, self.strides).to(pred_scores.device)
+        # 接收两个返回值
+        anchor_points, stride_tensor = make_anchor(feats_shape, self.strides)
+        anchor_points = anchor_points.to(pred_scores.device)
+        stride_tensor = stride_tensor.to(pred_scores.device)  # 🌟 步长也送入 GPU
+        #anchor_points = make_anchor(feats_shape, self.strides).to(pred_scores.device)
         #pred_dist为[B,N,64],而DFL需要[B,64,N]
         dist_permuted = pred_dist.permute(0,2,1)
         #pred_ltrb:相对距离[B,4,N]
         pred_ltrb = self.dfl(dist_permuted)
         #再次转置[B,N,4]
         pred_ltrb = pred_ltrb.permute(0,2,1)
+        #网格距离 × 步长 = 真实像素距离！
+        pred_ltrb = pred_ltrb * stride_tensor
         pred_bboxes = dist2bbox(pred_ltrb, anchor_points, xywh=False, dim=-1)
 
         #no_grad告诉pytorch，以下不参数梯度计算。.detach()会生成一个新的张量，并且计算不会返回修改权重
@@ -451,8 +458,9 @@ def dist2bbox(distance, anchor_points, xywh=True, dim=-1):
 #根据特征图尺寸和步长，将8400个坐标计算出锚点坐标
 def make_anchor(feats_shape, strides, grid_cell_offset=0.5):
     #feats_shape特征图尺寸[P3,P4,P5][(80,80),(40,40),(20,20)],strides步长[8,16,32],grid_cell_offset网格中心偏移量
-    #
     anchor_points = []
+    # 记录每个点对应的步长
+    stride_tensor = []
     for i, stride in enumerate(strides):
         h,w = feats_shape[i]
         #小网格的位置索引,[h,w]
@@ -461,5 +469,8 @@ def make_anchor(feats_shape, strides, grid_cell_offset=0.5):
         anchors = torch.stack((stride_x, stride_y), dim=-1).view(-1, 2) + grid_cell_offset
         anchor_points.append(anchors*stride)
 
+        # 生成对应数量的步长并记录 [h*w, 1]
+        stride_tensor.append(torch.full((h * w, 1), stride))
     #P3, P4, P5 的锚点在第 0 维度拼接起来: 6400 + 1600 + 400 = 8400,[8400, 2]
-    return torch.cat(anchor_points, dim=0)
+    # 返回两个值：绝对锚点坐标，以及对应的步长张量
+    return torch.cat(anchor_points, dim=0), torch.cat(stride_tensor, dim=0)
