@@ -11,17 +11,27 @@ class YOLODataset(Dataset):
     核心功能：读取图片与标签 -> Letterbox等比缩放 -> 坐标转换 -> 张量对齐输出
     """
 
-    def __init__(self, img_dir, label_dir, img_size=640):
+    def __init__(self, img_dir, label_dir, img_size=640, target_classes=None):
         """
         初始化数据集。
         Args:
             img_dir: 图片文件夹路径
             label_dir: YOLO格式的 .txt 标签文件夹路径
             img_size: 网络要求的输入尺寸，例如 640
+            target_classes: 要保留的原始类别 ID 列表，例如 [0, 2, 41, 56, 73]
+                            如果为 None，则保留所有类别
         """
         self.img_dir = img_dir
         self.label_dir = label_dir
         self.img_size = img_size
+        self.target_classes = target_classes
+
+        # 如果指定了目标类别，建立原始类别 ID -> 新类别 ID 的映射
+        # 例如 {0:0, 2:1, 41:2, 56:3, 73:4}
+        if target_classes is not None:
+            self.class_map = {orig_id: new_id for new_id, orig_id in enumerate(target_classes)}
+        else:
+            self.class_map = None
 
         # 获取所有图片的绝对路径列表
         # 假设图片格式为 .jpg
@@ -65,6 +75,12 @@ class YOLODataset(Dataset):
                     # 将 txt 中的一行字符串按空格切分，转为 float 列表
                     # l 格式: [cls_id, cx, cy, w, h]
                     l = np.array(line.strip().split(), dtype=np.float32)
+                    # 如果指定了目标类别，只保留包含的类别并重映射 ID
+                    if self.class_map is not None:
+                        orig_cls = int(l[0])
+                        if orig_cls not in self.class_map:
+                            continue  # 跳过不在目标类别中的标注
+                        l[0] = self.class_map[orig_cls]
                     labels.append(l)
 
         # 如果 labels 不为空，将其转为 numpy 矩阵；否则给一个形状为 [0, 5] 的空矩阵

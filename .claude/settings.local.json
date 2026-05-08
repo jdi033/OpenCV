@@ -2,7 +2,8 @@
   "permissions": {
     "allow": [
       "Bash(python train.py)",
-      "Bash(python inference.py)"
+      "Bash(python inference.py)",
+      "Bash(python -c ' *)"
     ]
   }
 }

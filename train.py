@@ -61,18 +61,20 @@ def train_model():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"当前使用的计算设备: {device}")
 
-    # 【改动 1】：COCO 数据集有 80 个类别，必须把 nc 改为 80！
-    NUM_CLASSES = 80
+    # COCO128 中标注最多的 5 个类别，重映射为 0~4
+    TARGET_CLASSES = [0, 2, 41, 56, 73]
+    NUM_CLASSES = len(TARGET_CLASSES)
+
     model = YOLOv8(nc=NUM_CLASSES).to(device)
     model.train()
 
     criterion = v8DetectionLoss(nc=NUM_CLASSES, reg_max=16).to(device)
 
-    # 【改动 2】：对接真实的 COCO128 文件夹路径，并将 Batch Size 调大一点利用 GPU (例如 4 或 8)
     dataset = YOLODataset(
         img_dir="coco128/images/train2017",
         label_dir="coco128/labels/train2017",
-        img_size=640
+        img_size=640,
+        target_classes=TARGET_CLASSES
     )
     dataloader = DataLoader(dataset, batch_size=4, shuffle=True, collate_fn=yolo_collate_fn)
 
@@ -81,7 +83,7 @@ def train_model():
 
     # 【改动 3】：创建存放权重的文件夹，并将 Epoch 数量调大
     os.makedirs("weights", exist_ok=True)
-    num_epochs = 100
+    num_epochs = 300
 
     for epoch in range(num_epochs):
         epoch_loss = 0.0
@@ -107,11 +109,11 @@ def train_model():
         avg_loss = epoch_loss / len(dataloader)
         print(f"Epoch {epoch + 1}/{num_epochs} 结束 | 平均 Loss: {avg_loss:.4f}")
 
-        # 【改动 4】：每 10 个 Epoch，以及最后 1 个 Epoch 时，保存模型的“灵魂”！
-        if (epoch + 1) % 10 == 0 or (epoch + 1) == num_epochs:
-            save_path = f"weights/yolov8_custom_epoch_{epoch + 1}.pt"
+        # 每 50 个 Epoch，以及最后 1 个 Epoch 时，保存权重
+        if (epoch + 1) % 50 == 0 or (epoch + 1) == num_epochs:
+            save_path = "weights/yolov8_nc{}_epoch_{}.pt".format(NUM_CLASSES, epoch + 1)
             torch.save(model.state_dict(), save_path)
-            print(f"模型权重已保存至: {save_path}")
+            print("模型权重已保存至: " + save_path)
 
     print("\n训练圆满结束！你的模型已经学到了知识！")
 

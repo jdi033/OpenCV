@@ -204,10 +204,8 @@ def run_inference(image_path, weight_path, num_classes=80):
 # 执行入口
 # ==========================================
 if __name__ == '__main__':
-    # 请确保你在项目中放入了一张名为 test.jpg 的测试图片
-    # 如果你跑的是 COCO 数据集，权重文件应该是 epoch_50.pt，类别数是 80
     run_inference(
         image_path="test.jpg",
-        weight_path="weights/yolov8_custom_epoch_100.pt",
-        num_classes=80
+        weight_path="weights/yolov8_nc5_epoch_300.pt",
+        num_classes=5
     )
