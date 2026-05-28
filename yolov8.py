@@ -41,7 +41,8 @@ class Bottleneck(nn.Module):
         c = int(c2*e)
         #Bottleneck使用两层卷积，所以分别得到 k[0]和 k[1]作为核大小，(k[i]元素可能是整数，也可能是元组)
         self.conv1 = Conv(c1, c, k[0], s, p)
-        self.conv2 = Conv(c, c2, k[1], s, p)
+        #conv2 的步长应该固定为 1，下采样只由 conv1 负责
+        self.conv2 = Conv(c, c2, k[1], 1, p)
         #启动残差连接，并且初始通道数等于最终通道数
         self.add = add and c1==c2
 
@@ -77,9 +78,9 @@ class SPPF(nn.Module):
         #如果直接使用c1作为输入通道数，在经过3次最大池化层后，最后一个卷积的输入通道会是4*c1，引发输入通道和参数计算量负载
         #所以将c1//2特征减半，保留原来特征的同事，降低计算负载
         c_ = c1//2
-        self.conv1 = nn.Conv2d(c1, c_, 1, 1)
+        self.conv1 = Conv(c1, c_, 1, 1)
         #第二个卷积，会接收第一个卷积的输出，3个MaxPool2d的输出
-        self.conv2 = nn.Conv2d(c_*4, c2, 1, 1)
+        self.conv2 = Conv(c_*4, c2, 1, 1)
         #最大池化层，保证输入与输出通道数不变
         self.m = nn.MaxPool2d(kernel_size=k, stride=1, padding=k // 2)
 
@@ -94,6 +95,8 @@ class SPPF(nn.Module):
 class DFL(nn.Module):
     # DFL：回归预测时，预测框距离监测点的位置(l,d,r,u)的概率预测
     #reg_max=16：距离检测点每个位置的距离维度数
+    # DFL不直接预测一个距离值，而是预测一个概率分布。每个方向（左、上、右、下）各预测 reg_max=16 个离散距离档位（0, 1, 2,..., 15）的概率，最后加权求和得到最终距离。
+    #每个锚点的回归预测 = 4个方向 × 16个距离档位 = 64维
     def __init__(self, reg_max=16):
         super().__init__()
         self.conv = nn.Conv2d(reg_max, 1, 1, bias=False).requires_grad_(False)
@@ -112,6 +115,7 @@ class DFL(nn.Module):
         #对维度1使用softmax函数，使得对于每一个位置，16个距离维度的概率总和为1
         prob_dist = x_reshape.softmax(1)
         #[10,16,4,6400]->[10,1,4,6400]->[10,4,6400]
+        #[B, 64, N] → [B, 4, 16, N](16个档位的概率) → softmax → 加权求和(得到l, t, r, b四个距离值) → [B, 4, N]
         return self.conv(prob_dist).view(b, 4, a)
 
 class Detect(nn.Module):
@@ -163,9 +167,11 @@ class Detect(nn.Module):
         y_cls=[]
         y_reg=[]
         for i in range(self.nl):
-            #将特征图展平，cls_out:[10,80,6400],reg_out:[10,64,6400]
+            # cls_out: [B, nc, H, W]([B, 80, 80, 80]), reg_out: [B, 64, H, W]([B, 64, 80, 80])
+            #空间维度 H×W 就是该层的锚点数量（如 80×80=6400）
             cls_out = self.cv2[i](x[i])
             reg_out = self.cv3[i](x[i])
+            #view后：[B, 80, 6400]（6400个锚点，每个锚点在每种类别的得分）。 [B, 64, 6400]（每个锚点在每个维度的回归）
             y_cls.append(cls_out.view(shape[0], self.nc, -1))
             y_reg.append(reg_out.view(shape[0], self.reg_output_dim, -1))
 
@@ -176,12 +182,9 @@ class Detect(nn.Module):
 
         #训练阶段
         if self.training:
-            # pred:[10, 144, 6400+1600+400]
-            #pred = torch.cat((reg_concatenated, cls_concatenated), 1)
-            #return pred
-            # 不要 torch.cat 拼接了，直接返回分离的特征图！
-            # cls_concatenated: [B, 80, 8400] -> 转置为 [B, 8400, 80] (适应 Loss 接收)
-            # reg_concatenated: [B, 64, 8400] -> 转置为 [B, 8400, 64]
+            #训练时 — 返回两个张量，供 Loss 函数分别处理
+            # cls_concatenated: [B, 80, 8400] -> 转置为 [B, 8400, 80] (BCEWithLogitsLoss 计算分类损失)
+            # reg_concatenated: [B, 64, 8400] -> 转置为 [B, 8400, 64] (DFL 解码后计算 IoU 回归损失)
             return cls_concatenated.permute(0, 2, 1), reg_concatenated.permute(0, 2, 1)
         #推理阶段
         else:
@@ -296,7 +299,7 @@ class TaskAlignedAssigner(nn.Module):
         # 如果标签 > -1，就是真实的缺陷，mask 值为 1.0；否则为 0.0
         mask_gt = (gt_labels > -1.0).float().expand(B, M, N)  # [B, M, N]
 
-        # 2. 将 -1 强行拉回 0，防止底层 CUDA 的 gather 操作数组越界崩溃！
+        # 2. 将 最小值-1 改成 0，防止底层 CUDA 的 gather 操作数组越界崩溃！
         # 因为有 mask_gt 兜底，这里借用 0 不会产生任何实质影响
         target_labels = gt_labels.long().clamp(min=0).expand(B, M, N)
         #预测分类对于真是分类的分类得分
