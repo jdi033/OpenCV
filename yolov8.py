@@ -1,5 +1,8 @@
+import math
+
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 #自动填充
 #当需要输入通道数与输出通道数保持一致时，stride步长为1时，计算需要填充多少
@@ -347,6 +350,56 @@ def bbox_iou_1v1(box1, box2):
 
     return inter_area / union_area
 
+def bbox_ciou(box1, box2, eps=1e-7):
+    b1_x1, b1_x2, b1_y1, b1_y2 = box1[:, 0], box1[:, 1], box1[:, 2], box1[:, 3]
+    b2_x1, b2_x2, b2_y1, b2_y2 = box2[:, 0], box2[:, 1], box2[:, 2], box2[:, 3]
+
+    #计算交集
+    inter_x1 = torch.max(b1_x1, b2_x1)
+    inter_y1 = torch.max(b1_y1, b2_y1)
+    inter_x2 = torch.min(b1_x2, b2_x2)
+    inter_y2 = torch.min(b1_y2, b2_y2)
+
+    inter_w = (inter_x2 - inter_x1).clamp(min=0)
+    inter_h = (inter_y2 - inter_y1).clamp(min=0)
+    inter_area = inter_w * inter_h
+
+    #计算并集
+    w1, h1 = b1_x2 - b1_x1, b1_y2 - b1_y1
+    w2, h2 = b2_x2 - b2_x1, b2_y2 - b2_y1
+
+    area1 = w1 * h1
+    area2 = w2 * h2
+    union_area = area1 + area2 - inter_area
+
+    #基础iou
+    iou = inter_area / union_area
+
+    #两个框的最小包围框，即把两个框全部包含在内
+    cw = torch.max(b1_x2, b2_x2) - torch.min(b1_x1, b2_x1)
+    ch = torch.max(b1_y2, b2_y2) - torch.min(b1_y1, b2_y1)
+    c2 = cw ** 2 + ch ** 2 + eps
+
+    #中心点距离平方
+    pred_cx, pred_cy = (b1_x1+b1_x2)/2, (b1_y1+b1_y2)/2
+    gt_cx, gt_cy = (b2_x1+b2_x2)/2, (b2_y1+b2_y2)/2
+    rho2 = (pred_cx-gt_cx)**2 + (pred_cy-gt_cy)**2
+
+    # CIoU 额外项：宽高比一致性惩罚 v
+    # arctan(w/h) 的差异，衡量宽高比一致性
+    v = (4 / (math.pi ** 2)) * torch.pow(
+        torch.atan(w2 / (h2 + eps)) - torch.atan(w1 / (h1 + eps)), 2
+    )
+
+    # 动态权重 alpha
+    with torch.no_grad():
+        alpha = v / (v - iou + (1 + eps))
+
+    #最终iou
+    ciou = iou - (rho2 / c2 + v * alpha)
+
+    return ciou
+
 class v8DetectionLoss(nn.Module):
     def __init__(self, nc=2, reg_max=16):
         super(v8DetectionLoss, self).__init__()
@@ -362,13 +415,15 @@ class v8DetectionLoss(nn.Module):
         #pred_dist为回归分支处理的最原始64维分布特征[B,N,64]
         B,N,nc = pred_scores.shape
 
+        device = pred_scores.device
+
         #特征图尺寸
         feats_shape = [(image_shape[0]//s, image_shape[1]//s) for s in self.strides]
         #锚点的位置[N,2]
         # 接收两个返回值
         anchor_points, stride_tensor = make_anchor(feats_shape, self.strides)
-        anchor_points = anchor_points.to(pred_scores.device)
-        stride_tensor = stride_tensor.to(pred_scores.device)  # 🌟 步长也送入 GPU
+        anchor_points = anchor_points.to(device)
+        stride_tensor = stride_tensor.to(device)  # 🌟 步长也送入 GPU
         #anchor_points = make_anchor(feats_shape, self.strides).to(pred_scores.device)
         #pred_dist为[B,N,64],而DFL需要[B,64,N]
         dist_permuted = pred_dist.permute(0,2,1)
@@ -413,10 +468,11 @@ class v8DetectionLoss(nn.Module):
         #pred_scores预测分类得分，target_scores该预测点应该预测的缺陷以及最高得分，最后target_scores_sum总正样本数算平均
         loss_cls = self.bce(pred_scores, target_scores).sum() / target_scores_sum
 
-        #计算回归损失
+        #计算回归损失 (CIoU) 与分布损失 (DFL) 协同结算
         #zeros(1)创建一维的元素为0的张量，
         #device=pred_scores.device使得创建的loss_box张量和网络输出的张量在同一张显卡上，不会设备报错
-        loss_box = torch.zeros(1, device=pred_scores.device)
+        loss_box = torch.zeros(1, device=device)
+        loss_dfl = torch.zeros(1, device=device)
 
         if fg_mask.sum() > 0:
             for b in range(B):
@@ -428,16 +484,47 @@ class v8DetectionLoss(nn.Module):
                 #这些缺陷的真实框
                 pos_gt_bboxes = gt_bboxes[b, assigned_gt_idx]
                 #计算预测框与真实框的iou
-                bbox_iou = bbox_iou_1v1(pos_pred_bboxes, pos_gt_bboxes)
+                bbox_iou = bbox_ciou(pos_pred_bboxes, pos_gt_bboxes)
 
                 #计算总回归损失，iou越大越好，使用(1-iou)作为惩罚
                 loss_box += (1-bbox_iou).sum()
 
-            #平均值
-            loss_box = loss_box / fg_mask.sum()
+                # DFL 损失计算 (为 64 维分布灌入监督信号)
+                pos_anchors = anchor_points[pos_idxs]
+                pos_strides = stride_tensor[pos_idxs]
 
-        #1.5为权重放大系数
-        return loss_cls + loss_box*1.5
+                # 逆向推导真实边界框到正样本锚点中心的真实网格距离 (gt_ltrb)
+                gt_lt = pos_anchors - pos_gt_bboxes[:, :2]
+                gt_rb = pos_gt_bboxes[:, 2:] - pos_anchors
+                # 除以对应特征层的步长，转换到真实的网格坐标系尺度
+                gt_ltrb = torch.cat([gt_lt, gt_rb], dim=-1) / pos_strides
+                # 边界防御：限制在 0 到 reg_max-1 之间，防止越界
+                gt_ltrb = gt_ltrb.clamp(min=0, max=self.reg_max - 1.0 - 1e-4)
+
+                # 提取正样本对应的原始 64 维预测分布并对齐维度
+                pos_pred_dist = pred_dist[b, pos_idxs]  # [Num_pos, 64]
+                pos_pred_dist = pos_pred_dist.view(-1, 4, self.reg_max).view(-1, self.reg_max)  # [Num_pos * 4, 16]
+                flat_gt_ltrb = gt_ltrb.view(-1)  # [Num_pos * 4]
+
+                # 计算 DFL 的双侧分数交叉熵
+                tl = flat_gt_ltrb.long()
+                tr = tl + 1
+                wl = tr.float() - flat_gt_ltrb
+                wr = 1.0 - wl
+
+                loss_dfl_step = (
+                        F.cross_entropy(pos_pred_dist, tl, reduction='none') * wl +
+                        F.cross_entropy(pos_pred_dist, tr, reduction='none') * wr
+                )
+                loss_dfl += loss_dfl_step.sum()
+
+            # 统一按正样本总数做均值归一化
+            loss_box = loss_box / fg_mask.sum()
+            loss_dfl = loss_dfl / fg_mask.sum()
+
+        #超参数权重协同配比 (7.5 与 1.5)
+        total_loss = loss_cls * 1.0 + loss_box * 7.5 + loss_dfl * 1.5
+        return total_loss
 
 #预测框对锚点的相对距离 + 锚点位置 -> 绝对距离
 def dist2bbox(distance, anchor_points, xywh=True, dim=-1):

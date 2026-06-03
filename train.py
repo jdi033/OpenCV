@@ -3,6 +3,7 @@ import torch
 from torch.utils.data import DataLoader
 import torch.optim as optim
 import os
+from torch.optim.lr_scheduler import OneCycleLR
 
 # ==========================================
 # 工业级模块化引入：从你写的另两个文件导入核心组件
@@ -70,6 +71,10 @@ def train_model():
 
     criterion = v8DetectionLoss(nc=NUM_CLASSES, reg_max=16).to(device)
 
+    # 创建存放权重的文件夹，并将 Epoch 数量调大
+    os.makedirs("weights", exist_ok=True)
+    num_epochs = 300
+
     dataset = YOLODataset(
         img_dir="coco128/images/train2017",
         label_dir="coco128/labels/train2017",
@@ -80,10 +85,15 @@ def train_model():
 
     # 3. 配置优化器 (Optimizer)
     optimizer = optim.AdamW(model.parameters(), lr=1e-3, weight_decay=1e-4)
-
-    # 【改动 3】：创建存放权重的文件夹，并将 Epoch 数量调大
-    os.makedirs("weights", exist_ok=True)
-    num_epochs = 300
+    # 使用Warmup 与 Cosine Annealing (余弦退火)调整学习率
+    scheduler = OneCycleLR(
+        optimizer,
+        max_lr=1e-3, #顶峰学习率
+        steps_per_epoch=len(dataset),
+        epochs=num_epochs,
+        pct_start=0.05, #前5%使用Warmup
+        anneal_strategy='cos' #余弦退火
+    )
 
     for epoch in range(num_epochs):
         epoch_loss = 0.0
@@ -100,6 +110,7 @@ def train_model():
             loss = criterion(pred_scores, pred_dist, gt_labels, gt_bboxes)
             loss.backward()
             optimizer.step()
+            scheduler.step() #动态调整学习率
 
             epoch_loss += loss.item()
 
