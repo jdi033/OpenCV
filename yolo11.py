@@ -106,6 +106,8 @@ class Attention(nn.Module):
         #每个头处理的通道处
         self.head_dim = dim // num_heads
         #Q,K需降维后计算，减少计算量
+        #降维的原因是：qk只负责寻找“谁与谁相关”，计算相关性可以不完全计算所有维度，而且v保留全部信息，使用的是原始维度
+        #对于信息缺失，yolo11还做了残差连接（保留原始信息），PE补全空间位置信息，FFN重新做通道融合
         self.key_dim = int(self.head_dim * attn_ratio)
         #缩放因子，防止点积过大导致softmax饱和
         self.scale = self.head_dim ** -0.5
@@ -133,12 +135,14 @@ class Attention(nn.Module):
         #softmax归一化
         attn = attn.softmax(dim=-1)
         #V加权求和
+        #attn[B, heads, N, N]，后两位attn[i,j]表示第i个位置对第j个位置的关注权重，而v[B,heads,head_dim,N]，后一位v[j]表示位置j的信息
+        #我们想要的是：位置i上，所有位置j的加权汇总信息，即out[:, i] = Σ_j A[i, j] * V[:, j](最后一位j上数据相乘)
+        #而v的最后两位是[head_dim, j]，所以只能点积attn_T[j,i]，最后的结果是[head_dim,i]，最后一位就表示位置i的所有信息加权
         out = v @ attn.transpose(-2, -1)
         #多头拼回所有通道
         out = out.reshape(B, C, H, W)
-        #加入位置编码
+        #加入位置编码，使用v的原因：v表示该位置的内容信息，v是经过qkv投影后的特征，out与v是同一特征空间，再使用3*3提取局部位置关系
         out = out + self.pe(v.reshape(B, C, H, W))
         #输出投影后的维度
         return self.proj(out)
 
-    #疑问：1.加权求和时为什么是attn.transpose(-2, -1)。2.位置编码为什么是v.reshape(B, C, H, W)
