@@ -146,3 +146,49 @@ class Attention(nn.Module):
         #输出投影后的维度
         return self.proj(out)
 
+#PSA 基础残差块
+class PSABlock(nn.Module):
+    def __init__(self, c, attn_ratio=0.5, num_heads=4, shortcut=True):
+        super().__init__()
+        self.add = shortcut
+        #注意力负责空间位置之间的信息交互
+        self.attn = Attention(c, num_heads=max(num_heads, 1), attn_ratio=attn_ratio)
+        #通道维度上的非线性变换，FFN负责通道之间的信息重组
+        self.ffn = nn.Sequential(
+            #使用1*1卷积，增强通道交互
+            Conv(c, c*2, 1, 1),
+            #再使用1*1卷积，降回原通道
+            Conv(c*2, c, 1, 1, act=False),
+        )
+
+    def forward(self, x):
+        x = x + self.attn(x) if self.add else self.ffn(x)
+        x = x + self.ffn(x) if self.add else self.ffn(x)
+        return x
+
+#深层注意力模块
+class C2PSA(nn.Module):
+    #C2分流结构 + PSA 注意力，用于深层语义增强
+    def __init__(self, c1, c2, n=1, e=0.5):
+        super().__init__()
+        #C2PSA要求输入通道数等于输出通道数
+        assert c1==c2
+        #隐藏层通道数
+        self.c = int(c1*e)
+        #使用1*1卷积拆成2份
+        self.conv1 = Conv(c1, 2*self.c, 1, 1)
+        #将2份拼回原有通道
+        self.conv2 = Conv(2*self.c, c2, 1, 1)
+        #n个C2PSA模块
+        self.m = nn.Sequential(
+            *(
+                PSABlock(c, attn_ratio=0.5, num_heads=(self.c//64, 1))
+                for _ in range(n)
+            )
+        )
+
+    def forward(self, x):
+        a, b = self.conv1(x).split((self.c, self.c), dim=1)
+        a = self.m(a)
+        return self.conv2(torch.cat((a, b), dim=1))
+
