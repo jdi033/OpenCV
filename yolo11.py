@@ -26,7 +26,16 @@ class Conv(nn.Module):
     def __init__(self, c1, c2, k=1, s=1, p=None, d=1, g=1, act=True):
         super().__init__()
         #bias=False不需要偏置是因为后续会使用BatchNorm2d归一化
-        self.conv = nn.Conv2d(c1, c2, k, s, autopad(k, p, d), g, bias=False)
+        self.conv = nn.Conv2d(
+            in_channels=c1,
+            out_channels=c2,
+            kernel_size=k,
+            stride=s,
+            padding=autopad(k, p, d),
+            dilation=d,
+            groups=g,
+            bias=False
+            )
         self.bn = nn.BatchNorm2d(c2)
         #使用哪种激活函数，act if isinstance(act, nn.Module)：如果自己实现了激活函数，则用
         self.act = self.default_act if act is True else act if isinstance(act, nn.Module) else nn.Identity()
@@ -66,7 +75,7 @@ class C3k(nn.Module):
         self.conv3 = Conv(2*c, c2, 1, 1)
         self.m = nn.Sequential(
             *(
-                Bottleneck(c1, c2, k=(k,k), add=shortcut, e=1.0)
+                Bottleneck(c, c, k=(k,k), add=shortcut, e=1.0)
                 for _ in range(n)
             )
         )  #n个Bottleneck，并且可以自定义卷积核大小k
@@ -104,13 +113,13 @@ class Attention(nn.Module):
         #多头数量，防止为0
         self.num_heads = max(num_heads, 1)
         #每个头处理的通道处
-        self.head_dim = dim // num_heads
+        self.head_dim = dim // self.num_heads
         #Q,K需降维后计算，减少计算量
         #降维的原因是：qk只负责寻找“谁与谁相关”，计算相关性可以不完全计算所有维度，而且v保留全部信息，使用的是原始维度
         #对于信息缺失，yolo11还做了残差连接（保留原始信息），PE补全空间位置信息，FFN重新做通道融合
         self.key_dim = int(self.head_dim * attn_ratio)
         #缩放因子，防止点积过大导致softmax饱和
-        self.scale = self.head_dim ** -0.5
+        self.scale = self.key_dim ** -0.5
         #qkv总通道数,v使用原通道数
         qkv_channels = dim + 2 * self.key_dim * self.num_heads
         #使用1*1卷积生成Q,K,V
@@ -162,7 +171,7 @@ class PSABlock(nn.Module):
         )
 
     def forward(self, x):
-        x = x + self.attn(x) if self.add else self.ffn(x)
+        x = x + self.attn(x) if self.add else self.attn(x)
         x = x + self.ffn(x) if self.add else self.ffn(x)
         return x
 
@@ -182,13 +191,137 @@ class C2PSA(nn.Module):
         #n个C2PSA模块
         self.m = nn.Sequential(
             *(
-                PSABlock(c, attn_ratio=0.5, num_heads=(self.c//64, 1))
+                PSABlock(self.c, attn_ratio=0.5, num_heads=max(self.c//64, 1))
                 for _ in range(n)
             )
         )
 
     def forward(self, x):
         a, b = self.conv1(x).split((self.c, self.c), dim=1)
-        a = self.m(a)
+        b = self.m(b)
         return self.conv2(torch.cat((a, b), dim=1))
 
+class SPPF(nn.Module):
+    def __init__(self, c1, c2, k=5):
+        super().__init__()
+        #如果直接使用c1作为输入通道数，在经过3次最大池化层后，最后一个卷积的输入通道会是4*c1，引发输入通道和参数计算量负载
+        #所以将c1//2特征减半，保留原来特征的同事，降低计算负载
+        c_ = c1//2
+        self.conv1 = Conv(c1, c_, 1, 1)
+        #第二个卷积，会接收第一个卷积的输出，3个MaxPool2d的输出
+        self.conv2 = Conv(c_*4, c2, 1, 1)
+        #最大池化层，保证输入与输出通道数不变
+        self.m = nn.MaxPool2d(kernel_size=k, stride=1, padding=k // 2)
+
+    #SPPF：卷积->3个最大池化层->卷积
+    def forward(self, x):
+        y = self.conv1(x)
+        y1 = self.m(y)
+        y2 = self.m(y1)
+        return self.conv2(torch.cat((y, y1, y2, self.m(y2)), 1))
+
+#DFL
+class DFL(nn.Module):
+    # DFL：回归预测时，预测框距离监测点的位置(l,d,r,u)的概率预测
+    #reg_max=16：距离检测点每个位置的距离维度数
+    # DFL不直接预测一个距离值，而是预测一个概率分布。每个方向（左、上、右、下）各预测 reg_max=16 个离散距离档位（0, 1, 2,..., 15）的概率，最后加权求和得到最终距离。
+    #每个锚点的回归预测 = 4个方向 × 16个距离档位 = 64维
+    def __init__(self, reg_max=16):
+        super().__init__()
+        self.conv = nn.Conv2d(reg_max, 1, 1, bias=False).requires_grad_(False)
+        #生成一个长度为reg_max的数组：[0,1,2...,15]
+        grid = torch.arange(reg_max, dtype=torch.float)
+        #赋值self.grid形状: [1,16,1,1]
+        #self.register_buffer('grid', grid.view(1, reg_max, 1, 1))
+        self.conv.weight.data[:] = nn.Parameter(grid.view(1, reg_max, 1, 1))
+        self.c1 = reg_max
+
+    def forward(self, x):
+        #b为批次大小，c为4*距离维度数(即总共需要预测的维度数)，a为该特征图的总检测点数，[10,64,6400]
+        b, c, a = x.shape
+        #对x调整形状: [10,64,6400]->[10,4,16,6400]->[10,16,4,6400]
+        x_reshape = x.view(b, 4, self.c1, a).permute(0, 2, 1, 3)
+        #对维度1使用softmax函数，使得对于每一个位置，16个距离维度的概率总和为1
+        prob_dist = x_reshape.softmax(1)
+        #[10,16,4,6400]->[10,1,4,6400]->[10,4,6400]
+        #[B, 64, N] → [B, 4, 16, N](16个档位的概率) → softmax → 加权求和(得到l, t, r, b四个距离值) → [B, 4, N]
+        return self.conv(prob_dist).view(b, 4, a)
+
+class Detect(nn.Module):
+    dynamic = False
+    export = False
+    #nc=80:最终的分类个数，ch=()：特征图(P3,P4,P5)
+    def __init__(self, nc=80, ch=()):
+        super().__init__()
+        self.nc = nc
+        self.nl = len(ch)
+        self.reg_max = 16
+        #回归预测的每个检测点的维度(位置个数*距离维度)
+        self.reg_output_dim = 4*self.reg_max
+        #分类+回归的总维度数
+        self.no = nc + 4*self.reg_max
+        self.stride = torch.zeros(len(ch))
+
+        #分类和回归中间通道数
+        # 参考浅层特征图宽度 ch[0]//4，但如果类别数 nc 极大，用 min(self.nc, 100) 来防止分类分支的中间层变得过度臃肿
+        c2 = max(ch[0] // 4, min(self.nc, 100))
+        #下限兜底 16 和 4*reg_max (即 64)，确保回归分支在提取特征时有足够的维度去表达 64 个概率分布；同时参考浅层特征图的宽度 ch[0]//4
+        c3 = max(16, ch[0]//4, 4*self.reg_max)
+
+        #分类分支，for x in ch：每个特征图，使用3个卷积，最后通道数为分类个数
+        self.cv2 = nn.ModuleList(
+            nn.Sequential(
+                Conv(x, c2, 3),
+                Conv(c2, c2, 3),
+                nn.Conv2d(c2, self.nc, 1),
+            ) for x in ch
+        )
+
+        #回归分支，最后通道数为检测点4个位置的距离维度
+        self.cv3 = nn.ModuleList(
+            nn.Sequential(
+                Conv(x, c3, 3),
+                Conv(c3, c3, 3),
+                nn.Conv2d(c3, 4*self.reg_max, 1),
+            ) for x in ch
+        )
+
+        self.dfl = DFL(self.reg_max) if self.reg_max > 1 else nn.Identity()
+
+    def forward(self, x):
+        shape = x[0].shape
+
+        #分类与回归分支，每个特征图经过卷积后的结果
+        #y_cls: [[10,80,80,80],[10,80,40,40],[10,80,20,20]]
+        y_cls=[]
+        y_reg=[]
+        for i in range(self.nl):
+            # cls_out: [B, nc, H, W]([B, 80, 80, 80]), reg_out: [B, 64, H, W]([B, 64, 80, 80])
+            #空间维度 H×W 就是该层的锚点数量（如 80×80=6400）
+            cls_out = self.cv2[i](x[i])
+            reg_out = self.cv3[i](x[i])
+            #view后：[B, 80, 6400]（6400个锚点，每个锚点在每种类别的得分）。 [B, 64, 6400]（每个锚点在每个维度的回归）
+            y_cls.append(cls_out.view(shape[0], self.nc, -1))
+            y_reg.append(reg_out.view(shape[0], self.reg_output_dim, -1))
+
+        #cls_concatenated:[10, 80, 6400+1600+400], reg_concatenated:[10, 64, 6400+1600+400]
+        cls_concatenated = torch.cat(y_cls, 2)
+        reg_concatenated = torch.cat(y_reg, 2)
+
+
+        #训练阶段
+        if self.training:
+            #训练时 — 返回两个张量，供 Loss 函数分别处理
+            # cls_concatenated: [B, 80, 8400] -> 转置为 [B, 8400, 80] (BCEWithLogitsLoss 计算分类损失)
+            # reg_concatenated: [B, 64, 8400] -> 转置为 [B, 8400, 64] (DFL 解码后计算 IoU 回归损失)
+            return cls_concatenated.permute(0, 2, 1), reg_concatenated.permute(0, 2, 1)
+        #推理阶段
+        else:
+            #在yolo中，多类别分类不能使用softmax，因为softmax只能用于类别之间不冲突(概率之和为1)，yolo可以预测出多个类别，是将多分类独立成多个二分类任务
+            #使用 Sigmoid 激活函数，将每个独立通道的 Logit 压缩到[0,1]之间
+            cls_scores = cls_concatenated.sigmoid()
+            #得到4个位置的距离，[10,4,6400+1600+400]
+            reg_results = self.dfl(reg_concatenated)
+            #[10,84,6400+1600+400]
+            out = torch.cat((cls_scores, reg_results), 1)
+            return out

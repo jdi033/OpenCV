@@ -218,7 +218,7 @@ class YOLOv8(nn.Module):
         self.c2f4 = C2f(128,128,n=2,add=True)
 
         self.conv5 = Conv(128, 256, k=3, s=2)
-        self.c2f5 = C2f(256,256,n=2,add=True)
+        self.c2f5 = C2f(256,256,n=1,add=True)
         self.sppf = SPPF(256,256,k=5)
 
         self.upsample = nn.Upsample(scale_factor=2, mode='nearest')
