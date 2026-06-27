@@ -5,12 +5,9 @@ import torch.optim as optim
 import os
 from torch.optim.lr_scheduler import OneCycleLR
 
-# ==========================================
-# 工业级模块化引入：从你写的另两个文件导入核心组件
-# ==========================================
-# 假设你的第一份文件叫 yolov8_custom.py
 from yolov8 import YOLOv8, v8DetectionLoss
-# 假设你的第二份文件叫 dataset.py
+from yolo11 import YOLO11
+
 from dataset import YOLODataset
 
 
@@ -66,7 +63,12 @@ def train_model():
     TARGET_CLASSES = [0, 2, 41, 56, 73]
     NUM_CLASSES = len(TARGET_CLASSES)
 
-    model = YOLOv8(nc=NUM_CLASSES).to(device)
+    #YOLOv8
+    #model = YOLOv8(nc=NUM_CLASSES).to(device)
+
+    #YOLO11
+    model = YOLO11(nc=NUM_CLASSES).to(device)
+
     model.train()
 
     criterion = v8DetectionLoss(nc=NUM_CLASSES, reg_max=16).to(device)
@@ -122,7 +124,7 @@ def train_model():
 
         # 每 50 个 Epoch，以及最后 1 个 Epoch 时，保存权重
         if (epoch + 1) % 50 == 0 or (epoch + 1) == num_epochs:
-            save_path = "weights/yolov8_nc{}_epoch_{}.pt".format(NUM_CLASSES, epoch + 1)
+            save_path = "weights/yolo11_nc{}_epoch_{}.pt".format(NUM_CLASSES, epoch + 1)
             torch.save(model.state_dict(), save_path)
             print("模型权重已保存至: " + save_path)
 

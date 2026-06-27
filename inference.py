@@ -6,6 +6,7 @@ import torchvision
 
 # 引入你的算法核心蓝图
 from yolov8 import YOLOv8, make_anchor, dist2bbox
+from yolo11 import YOLO11
 
 
 # ==========================================
@@ -102,7 +103,8 @@ def run_inference(image_path, weight_path, num_classes=80):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     # 2. 实例化网络，并加载你历经千辛万苦炼制出来的 .pt 权重
-    model = YOLOv8(nc=num_classes).to(device)
+    #model = YOLOv8(nc=num_classes).to(device)
+    model = YOLO11(nc=num_classes).to(device)
     # strict=False 允许一定的参数冗余
     model.load_state_dict(torch.load(weight_path, map_location=device), strict=False)
 
@@ -206,6 +208,6 @@ def run_inference(image_path, weight_path, num_classes=80):
 if __name__ == '__main__':
     run_inference(
         image_path="test.jpg",
-        weight_path="weights/yolov8_nc5_epoch_300.pt",
+        weight_path="weights/yolov11_nc5_epoch_300.pt",
         num_classes=5
     )
